@@ -1,4 +1,4 @@
-# GTA VI Trophy Rarity Forecast — AdaptiveRefreshEnsemble_v1
+# GTA VI Trophy Rarity Forecast — AdaptiveRefreshEnsemble_v2
 
 [![make.fun · gta6-trophy-rarity-forecast-01](https://make.fun/badge/gta6-trophy-rarity-forecast-01.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
 [![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/Fpeazy/gta6-trophy-rarity-forecast-01/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
@@ -11,7 +11,7 @@ Bounty: <https://make.fun/bounty/gta6-trophy-rarity-forecast-01>
 
 ## Method
 
-Adaptive refresh ensemble. Exophase prints each rate to 2 decimals and
+Adaptive refresh ensemble v2. Exophase prints each rate to 2 decimals and
 refreshes its counts on its own schedule, so a refresh that adds many fresh
 players dilutes every rate down. The program therefore models the two count
 curves separately — earners E(t) and players tracked P(t) — and takes the
@@ -27,7 +27,10 @@ than E. Which branch runs depends on whether the history ever moved:
    `ln(1 + hours)`, slopes clamped to [0, 3] and shrunk 50% toward the tier
    median, rate capped per tier: platinum 2%, gold 5%, silver 25%, bronze
    90%) and a logit-trend fit, averaged 50/50 in logit space, then shrunk
-   25% toward the last observed rate (persistence).
+   25% toward the last observed rate (persistence), then the median shifted
+   DOWN 0.55 logit — a late-refresh dilution prior (v2 change vs v1: a
+   refresh is near-certain inside the 4.5-day final window, and the
+   unshifted median ran too high after the final dilution).
 3. Spread on the logit scale combines a horizon term, the log-E fit
    residual, a rare-trophy floor, P-jump volatility (CV of the P increases),
    and a floor from the observed refresh jumps (half the median |Δlogit|
@@ -35,9 +38,11 @@ than E. Which branch runs depends on whether the history ever moved:
    A trophy at 100% stays pinned at 100.
 
 On the coordinator's synthetic holdout (5 worlds: flat, post-refresh,
-steady/weekend-spike/late-refresh 7-day): losses 1.33 / 0.079 / 0.29 /
-0.31 / 0.46 — the refresh world at 0.079 (rev2 scored 0.89 there) and
-90% coverage 0.98–1.00 on the 7-day worlds.
+steady/weekend-spike/late-refresh 7-day): losses 1.33 / 0.079 / 0.31 /
+0.29 / 0.31 — worst case 0.314, beating the house baseline in all four
+realistic 7-day worlds (baseline 0.894 / 0.431 / 0.373 / 0.326), and
+90% coverage 0.98–1.00 on the 7-day worlds. (v1 worst case was 0.461,
+losing only the late-refresh world.)
 
 ## Run
 

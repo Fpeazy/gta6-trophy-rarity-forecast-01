@@ -1,21 +1,14 @@
-// AdaptiveRefreshEnsemble_v1 — GTA VI trophy rarity forecast, rev3.
-// Forecasts each trophy's Exophase earn rate at the case target as five
-// quantiles (5/25/50/75/95%). Node 22, standard library only, no network,
-// fully deterministic.
-//
-// Idea: Exophase refreshes its counts on its own schedule. A refresh that
-// adds many fresh players dilutes every rate down, so the model works in
-// counts (earners E and players tracked P) and takes the rate as E/P.
-//   * FROZEN branch (history never moved): the practice cases show one
-//     refresh multiplies P by ~6.06 while earners grow only ~1.22x, so the
-//     forecast rate is last_rate x 1.22/6.06 with a wide logit spread.
-//   * MOVING branch (history moved): ensemble of a counts fit (log E and
-//     log P against ln(1+hours), tier-shrunk slopes) and a logit-trend fit,
-//     averaged 50/50 in logit space, shrunk 25% toward the last rate, with
-//     a spread that grows with horizon, fit residual, rarity, P-jump
-//     volatility and the observed refresh-jump size.
-import { readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+// AdaptiveRefreshEnsemble_v2 — GTA VI trophy rarity forecast (rev4).
+// Node 22, stdlib only, deterministic, no network.
+// Reads every *.in case in $MAKEFUN_INPUT_DIR (else /input/), writes one
+// JSON output per case to $MAKEFUN_OUTPUT_DIR (else /output/).
+// Method: frozen history -> predict the refresh itself (P x6.06, E x1.22);
+// moving history -> counts fit + logit-trend fit ensemble (50/50 in logit
+// space), shrunk 25% toward the last rate, then the moving-branch median
+// is shifted DOWN 0.55 logit (late-refresh dilution prior).
+
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 const Z = [-1.645, -0.674, 0, 0.674, 1.645];
 const TIER_CAP: Record<string, number> = {
@@ -24,55 +17,30 @@ const TIER_CAP: Record<string, number> = {
   silver: 25,
   bronze: 90,
 };
-// Observed on launch night: one refresh took P 638 -> 3868 (x6.06) while
-// earners grew only ~1.22x. These are the frozen-branch refresh factors.
-const REFRESH_P = 6.06;
-const REFRESH_E = 1.22;
-const FROZEN_SIGMA = 0.35;
 
 function clamp(x: number, lo: number, hi: number): number {
   return x < lo ? lo : x > hi ? hi : x;
 }
 
-function logitPct(rate: number): number {
-  const p = clamp(rate, 0.01, 99.99) / 100;
+function logit(pct: number): number {
+  const p = clamp(pct, 0.01, 99.99) / 100;
   return Math.log(p / (1 - p));
 }
 
-function invLogitPct(l: number): number {
-  const p = 1 / (1 + Math.exp(-l));
-  return clamp(p * 100, 0, 100);
+function invLogit(l: number): number {
+  const e = Math.exp(-clamp(l, -30, 30));
+  return 100 / (1 + e);
 }
 
 function round4(x: number): number {
   return Math.round(x * 10000) / 10000;
 }
 
-function quantilesFromLogit(centerLogit: number, sigma: number): number[] {
-  const qs = Z.map((z) => round4(invLogitPct(centerLogit + z * sigma)));
-  for (let i = 1; i < qs.length; i++) {
-    if (qs[i] < qs[i - 1]) qs[i] = qs[i - 1];
-  }
-  return qs;
-}
-
-function median(xs: number[]): number {
-  if (xs.length === 0) return 0;
-  const s = [...xs].sort((a, b) => a - b);
-  const n = s.length;
-  return n % 2 === 1 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
-}
-
-function mean(xs: number[]): number {
-  if (xs.length === 0) return 0;
-  return xs.reduce((a, b) => a + b, 0) / xs.length;
-}
-
-// Least squares y = a + b*x, plus the RMS residual of the fit.
-function lsq(xs: number[], ys: number[]): { a: number; b: number; resid: number } {
+// Least-squares fit of y against x; returns {intercept, slope}.
+function linFit(xs: number[], ys: number[]): { a: number; b: number } {
   const n = xs.length;
-  const mx = mean(xs);
-  const my = mean(ys);
+  const mx = xs.reduce((s, v) => s + v, 0) / n;
+  const my = ys.reduce((s, v) => s + v, 0) / n;
   let sxx = 0;
   let sxy = 0;
   for (let i = 0; i < n; i++) {
@@ -80,205 +48,222 @@ function lsq(xs: number[], ys: number[]): { a: number; b: number; resid: number 
     sxy += (xs[i] - mx) * (ys[i] - my);
   }
   const b = sxx > 0 ? sxy / sxx : 0;
-  const a = my - b * mx;
-  let ss = 0;
-  for (let i = 0; i < n; i++) {
-    const r = ys[i] - (a + b * xs[i]);
-    ss += r * r;
+  return { a: my - b * mx, b };
+}
+
+function median(xs: number[]): number {
+  if (xs.length === 0) return 0;
+  const s = [...xs].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 === 1 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+function quantilesFromLogit(medianLogit: number, sigma: number): number[] {
+  const qs = Z.map((z) => round4(clamp(invLogit(medianLogit + z * sigma), 0, 100)));
+  for (let i = 1; i < qs.length; i++) {
+    if (qs[i] < qs[i - 1]) qs[i] = qs[i - 1];
   }
-  return { a, b, resid: Math.sqrt(ss / n) };
+  return qs;
+}
+
+interface TrophyDef {
+  id: number;
+  tier: string;
 }
 
 interface Snap {
-  h: number; // hours since the first read
-  P: number; // players tracked
-  rates: number[]; // earn rate per trophy, percent
+  t: number; // hours since first read
+  P: number;
+  rates: number[];
 }
 
 function forecastCase(c: any): { trophies: { id: number; q: number[] }[] } {
-  const trophies: any[] = c.trophies;
+  const trophies: TrophyDef[] = c.trophies.map((t: any) => ({
+    id: t.id,
+    tier: String(t.tier || "bronze").toLowerCase(),
+  }));
   const n = trophies.length;
-  const firstAt = Date.parse(c.history[0].at);
-  const atMs = Date.parse(c.at);
+  const t0 = Date.parse(c.history[0].at);
   const targetMs = Date.parse(c.target);
-  const hTarget = (targetMs - firstAt) / 3600000; // target, hours since first read
-  const horizonDays = (targetMs - atMs) / 60000 / 1440; // horizon in days
+  const atMs = Date.parse(c.at);
+  const H_T = (targetMs - t0) / 3600000; // target hours since first read
+  const D = (targetMs - atMs) / 86400000; // horizon in days
 
-  // 1. Deduplicate history into unique snapshots (same P and same rates = one).
+  // Step 2: dedup into unique snapshots (same P and identical rates = one).
   const snaps: Snap[] = [];
-  const seen = new Set<string>();
-  // A read can lack a trophy (null rate); carry its last seen rate forward
-  // instead of treating the trophy as never earned.
-  const carried = new Array<number>(n).fill(0);
-  for (const r of c.history) {
-    const P = r.players_tracked as number;
-    const rates = (r.rates as (number | null)[]).map((v, i) => {
-      if (v === null || v === undefined) return carried[i];
-      carried[i] = v;
-      return v;
-    });
-    const key = P + "|" + rates.join(",");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    snaps.push({ h: (Date.parse(r.at) - firstAt) / 3600000, P, rates });
+  for (const h of c.history) {
+    const t = (Date.parse(h.at) - t0) / 3600000;
+    const P = Number(h.players_tracked);
+    const rates: number[] = (h.rates as number[]).map((r) => Number(r));
+    const dup = snaps.some(
+      (s) => s.P === P && s.rates.length === rates.length && s.rates.every((v, i) => v === rates[i]),
+    );
+    if (!dup) snaps.push({ t, P, rates });
   }
-
+  snaps.sort((a, b) => a.t - b.t);
   const last = snaps[snaps.length - 1];
-  const lastRates = last.rates;
 
-  // 2. Reconstruct integer earners E per trophy per snapshot, monotone
-  // non-decreasing over time; a trophy at 100% has E = P.
-  const E: number[][] = []; // E[s][i]
-  const prevE = new Array<number>(n).fill(0);
+  // Step 3: integer earners per trophy per snapshot, monotone non-decreasing.
+  const E: number[][] = []; // E[snap][trophy]
   for (const s of snaps) {
-    const row: number[] = [];
-    for (let i = 0; i < n; i++) {
-      let e: number;
-      if (s.rates[i] >= 100) {
-        e = s.P;
-      } else {
-        e = Math.round((s.rates[i] / 100) * s.P);
-      }
-      if (e < prevE[i]) e = prevE[i];
-      prevE[i] = e;
-      row.push(e);
+    E.push(
+      s.rates.map((r, i) => {
+        if (r >= 100) return s.P;
+        return Math.round((r / 100) * s.P);
+      }),
+    );
+  }
+  for (let i = 0; i < n; i++) {
+    for (let s = 1; s < snaps.length; s++) {
+      if (E[s][i] < E[s - 1][i]) E[s][i] = E[s - 1][i];
     }
-    E.push(row);
   }
 
-  // 3. Observed movement: largest |delta logit(rate)| over any trophy,
-  // between consecutive unique snapshots.
-  let move = 0;
-  for (let s = 1; s < snaps.length; s++) {
-    for (let i = 0; i < n; i++) {
-      const d = Math.abs(logitPct(snaps[s].rates[i]) - logitPct(snaps[s - 1].rates[i]));
-      if (d > move) move = d;
+  // Step 4: observed movement = max |Δlogit(rate)| over trophies, snapshots.
+  let MOVE = 0;
+  for (let i = 0; i < n; i++) {
+    for (let s = 1; s < snaps.length; s++) {
+      const d = Math.abs(logit(snaps[s].rates[i]) - logit(snaps[s - 1].rates[i]));
+      if (d > MOVE) MOVE = d;
     }
   }
 
   const out: { id: number; q: number[] }[] = [];
 
-  // 4. FROZEN branch: at most one unique snapshot, or nothing ever moved.
-  if (snaps.length <= 1 || move < 0.05) {
-    const pTarget = last.P * REFRESH_P;
+  // Step 5: FROZEN branch (<=1 unique snapshot OR MOVE < 0.05).
+  if (snaps.length <= 1 || MOVE < 0.05) {
+    const P_t = last.P * 6.06;
     for (let i = 0; i < n; i++) {
-      if (lastRates[i] >= 100) {
+      if (last.rates[i] >= 100) {
         out.push({ id: trophies[i].id, q: [100, 100, 100, 100, 100] });
         continue;
       }
-      const eTarget = E[E.length - 1][i] * REFRESH_E;
-      const rate = (eTarget / pTarget) * 100;
-      out.push({ id: trophies[i].id, q: quantilesFromLogit(logitPct(rate), FROZEN_SIGMA) });
+      const E_t = E[snaps.length - 1][i] * 1.22;
+      const rate = (E_t / P_t) * 100;
+      out.push({ id: trophies[i].id, q: quantilesFromLogit(logit(rate), 0.35) });
     }
     return { trophies: out };
   }
 
-  // 5. MOVING branch.
-  const xs = snaps.map((s) => Math.log(1 + s.h));
-  const xTarget = Math.log(1 + hTarget);
+  // Step 6: MOVING branch (>=2 unique snapshots AND MOVE >= 0.05).
+  const xs = snaps.map((s) => Math.log(1 + s.t));
+  const xT = Math.log(1 + H_T);
 
-  // 5a. Fit log P vs ln(1+hours); slope clamped to [0, 3].
-  const pFit = lsq(xs, snaps.map((s) => Math.log(Math.max(s.P, 1))));
-  const pSlope = clamp(pFit.b, 0, 3);
-  const pFinal = Math.exp(pFit.a + pSlope * xTarget);
+  // 6a: fit log P vs ln(1+hours), slope clamp [0,3].
+  const fitP = linFit(xs, snaps.map((s) => Math.log(Math.max(1, s.P))));
+  const slopeP = clamp(fitP.b, 0, 3);
+  const P_final = Math.exp(fitP.a + slopeP * xT);
 
-  // 5b. Fit log E_i vs ln(1+hours) per trophy; slope clamped to [0, 3],
-  // then shrunk 50% toward its tier's median slope.
+  // 6b: fit log E_i vs ln(1+hours), slope clamp [0,3], shrink 50% toward
+  // the tier-median slope; E_i_final; rate_counts capped per tier.
+  const tierOf = (i: number) => trophies[i].tier;
   const rawSlopes: number[] = [];
-  const eFits: { a: number; b: number; resid: number }[] = [];
+  const fitsE: { a: number; b: number }[] = [];
   for (let i = 0; i < n; i++) {
-    const ys = snaps.map((s, si) => Math.log(Math.max(E[si][i], 0.5)));
-    const f = lsq(xs, ys);
-    eFits.push(f);
+    const ys = E.map((row) => Math.log(Math.max(1, row[i])));
+    const f = linFit(xs, ys);
+    fitsE.push(f);
     rawSlopes.push(clamp(f.b, 0, 3));
   }
   const tierMedianSlope: Record<string, number> = {};
   for (const tier of Object.keys(TIER_CAP)) {
-    const slopes = trophies
-      .map((t, i) => (t.tier === tier ? rawSlopes[i] : null))
-      .filter((v): v is number => v !== null);
-    tierMedianSlope[tier] = median(slopes);
+    const vals = rawSlopes.filter((_, i) => tierOf(i) === tier);
+    tierMedianSlope[tier] = median(vals);
   }
   const rateCounts: number[] = [];
-  const resids: number[] = [];
+  const residAll: number[] = [];
   for (let i = 0; i < n; i++) {
-    const med = tierMedianSlope[trophies[i].tier] ?? rawSlopes[i];
-    const slope = 0.5 * rawSlopes[i] + 0.5 * med;
-    const eFinal = Math.exp(eFits[i].a + slope * xTarget);
-    const cap = TIER_CAP[trophies[i].tier] ?? 90;
-    rateCounts.push(clamp((eFinal / pFinal) * 100, 0, cap));
-    resids.push(eFits[i].resid);
+    const bShrunk = 0.5 * rawSlopes[i] + 0.5 * (tierMedianSlope[tierOf(i)] ?? rawSlopes[i]);
+    const E_final = Math.exp(fitsE[i].a + bShrunk * xT);
+    let rc = (E_final / P_final) * 100;
+    rc = clamp(rc, 0, TIER_CAP[tierOf(i)] ?? 90);
+    rateCounts.push(rc);
+    // RMS residual of the log-E fit (step 6f).
+    const ys = E.map((row) => Math.log(Math.max(1, row[i])));
+    let ss = 0;
+    for (let s = 0; s < xs.length; s++) {
+      const r = ys[s] - (fitsE[i].a + fitsE[i].b * xs[s]);
+      ss += r * r;
+    }
+    residAll.push(Math.sqrt(ss / xs.length));
   }
 
-  // 5c. Fit logit(rate_i) vs ln(1+hours) per trophy, read at the target.
+  // 6c: fit logit(rate_i) vs ln(1+hours) -> rate_trend at H_T, tier-capped.
   const rateTrend: number[] = [];
   for (let i = 0; i < n; i++) {
-    const ys = snaps.map((s) => logitPct(s.rates[i]));
-    const f = lsq(xs, ys);
-    const cap = TIER_CAP[trophies[i].tier] ?? 90;
-    rateTrend.push(clamp(invLogitPct(f.a + f.b * xTarget), 0, cap));
+    const ys = snaps.map((s) => logit(s.rates[i]));
+    const f = linFit(xs, ys);
+    let rt = invLogit(f.a + f.b * xT);
+    rt = clamp(rt, 0, TIER_CAP[tierOf(i)] ?? 90);
+    rateTrend.push(rt);
   }
 
-  // P jumps between consecutive snapshots, for the spread terms.
-  const pJumps: number[] = [];
-  const jumpMedians: number[] = [];
+  // 6f (shared quantities): P-jump CV and refresh-jump floor.
+  const dP: number[] = [];
   for (let s = 1; s < snaps.length; s++) {
-    const dP = snaps[s].P - snaps[s - 1].P;
-    if (dP > 0) pJumps.push(dP);
-    if (snaps[s - 1].P > 0 && dP / snaps[s - 1].P > 0.05) {
-      const deltas: number[] = [];
+    const d = snaps[s].P - snaps[s - 1].P;
+    if (d > 0) dP.push(d);
+  }
+  let cvDP = 0;
+  if (dP.length >= 2) {
+    const m = dP.reduce((a, b) => a + b, 0) / dP.length;
+    const sd = Math.sqrt(dP.reduce((a, b) => a + (b - m) * (b - m), 0) / dP.length);
+    cvDP = m > 0 ? sd / m : 0;
+  }
+  const jumps: number[] = [];
+  for (let s = 1; s < snaps.length; s++) {
+    if (snaps[s].P > snaps[s - 1].P * 1.05) {
+      const ds: number[] = [];
       for (let i = 0; i < n; i++) {
-        deltas.push(Math.abs(logitPct(snaps[s].rates[i]) - logitPct(snaps[s - 1].rates[i])));
+        ds.push(Math.abs(logit(snaps[s].rates[i]) - logit(snaps[s - 1].rates[i])));
       }
-      jumpMedians.push(median(deltas));
+      jumps.push(median(ds));
     }
   }
-  let cvP = 0;
-  if (pJumps.length >= 2) {
-    const m = mean(pJumps);
-    if (m > 0) {
-      const varP = mean(pJumps.map((v) => (v - m) * (v - m)));
-      cvP = Math.sqrt(varP) / m;
-    }
-  }
-  const jumpFloor = jumpMedians.length > 0 ? 0.5 * median(jumpMedians) : 0;
+  const jumpFloor = jumps.length > 0 ? 0.5 * median(jumps) : 0;
 
   for (let i = 0; i < n; i++) {
-    if (lastRates[i] >= 100) {
+    if (last.rates[i] >= 100) {
       out.push({ id: trophies[i].id, q: [100, 100, 100, 100, 100] });
       continue;
     }
-    // 5d. Ensemble median in logit space: counts fit + trend fit, 50/50.
-    const logitM =
-      0.5 * logitPct(rateCounts[i]) + 0.5 * logitPct(rateTrend[i]);
-    // 5e. Persistence shrinkage: 75% ensemble, 25% last observed rate.
-    const logitFinal = 0.75 * logitM + 0.25 * logitPct(lastRates[i]);
-    const mFinal = invLogitPct(logitFinal);
-    // 5f. Spread: horizon + fit residual, rare-trophy floor, P-jump
-    // volatility, then a floor from the observed refresh-jump size.
-    let sigmaBase = Math.sqrt(0.25 * horizonDays + resids[i] * resids[i]);
+    // 6d: median ensemble in logit space.
+    const mLogit = 0.5 * logit(rateCounts[i]) + 0.5 * logit(rateTrend[i]);
+    // 6e: persistence shrinkage, then the V8 change — shift median DOWN
+    // 0.55 logit (late-refresh dilution prior).
+    let mFinal = 0.75 * mLogit + 0.25 * logit(last.rates[i]);
+    mFinal -= 0.55;
+    const mRate = invLogit(mFinal);
+
+    // 6f: spread.
+    const resid = residAll[i];
+    let sigmaBase = Math.sqrt(0.25 * D + resid * resid);
     sigmaBase = clamp(sigmaBase, 0.15, 2.5);
-    const rateFrac = mFinal / 100;
+    const rateFrac = mRate / 100;
     const rareFloor = Math.max(1, 0.005 / (rateFrac + 1e-6));
-    sigmaBase = sigmaBase * rareFloor * (1 + cvP / 2);
+    sigmaBase *= rareFloor * (1 + cvDP / 2);
     const sigma = Math.max(sigmaBase, jumpFloor, 0.3);
-    // 5g. Quantiles on the logit scale.
-    out.push({ id: trophies[i].id, q: quantilesFromLogit(logitFinal, sigma) });
+
+    // 6g: quantiles on logit(m_final) with sigma.
+    out.push({ id: trophies[i].id, q: quantilesFromLogit(mFinal, sigma) });
   }
   return { trophies: out };
 }
 
 function main(): void {
-  const inputDir = process.env.MAKEFUN_INPUT_DIR || "/input/";
-  const outputDir = process.env.MAKEFUN_OUTPUT_DIR || "/output/";
-  mkdirSync(outputDir, { recursive: true });
-  const files = readdirSync(inputDir)
+  const inDir = process.env.MAKEFUN_INPUT_DIR || "/input/";
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output/";
+  fs.mkdirSync(outDir, { recursive: true });
+  const files = fs
+    .readdirSync(inDir)
     .filter((f) => f.endsWith(".in"))
     .sort();
   for (const f of files) {
-    const c = JSON.parse(readFileSync(join(inputDir, f), "utf8"));
-    const out = forecastCase(c);
-    writeFileSync(join(outputDir, f.replace(/\.in$/, ".out")), JSON.stringify(out));
+    const raw = fs.readFileSync(path.join(inDir, f), "utf8");
+    const c = JSON.parse(raw);
+    const result = forecastCase(c);
+    const id = String(c.id);
+    fs.writeFileSync(path.join(outDir, `${id}.out`), JSON.stringify(result));
   }
 }
 
